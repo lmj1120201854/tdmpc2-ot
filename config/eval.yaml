@@ -1,0 +1,25 @@
+defaults:
+    - tdmpc2
+    - _self_
+
+# environment
+task: mw-assembly-sparse
+obs: state
+obs_save: rgbd
+num_envs: 1
+sim_backend: gpu
+
+# evaluation
+checkpoint: /absolute/path/to/checkpoint
+eval_episodes: 1
+# saving
+save_trajectory: true
+success_only: true
+log_path: .
+save_video: true
+
+# misc
+render_obs: false
+compile: false
+add_text: false
+n_stages: 2
