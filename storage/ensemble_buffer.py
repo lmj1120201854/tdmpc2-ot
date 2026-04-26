@@ -18,10 +18,14 @@ class EnsembleBuffer(Buffer):
 
         from storage.data_utils import load_dataset_as_td
 
+        # DEMO3 依赖 stage-id 的 int reward 做相等比较; 其它场景 (OT) 保持 float,
+        # 否则在线 float reward 与 offline int reward 写入同一 storage 时会 dtype 冲突.
+        _cast_int_reward = bool(getattr(cfg, "enable_reward_learning", False))
         demo_dataset = load_dataset_as_td(
             _cfg2.demo_path,
             num_traj=_cfg2.n_demos,
             success_only=_cfg2.demo_success_only,
+            cast_int_reward=_cast_int_reward,
         )
         cfg.n_demos = len(demo_dataset)
         _cfg2.buffer_size = (len(demo_dataset) + int(len(demo_dataset) == 1)) * len(demo_dataset[0]) + 100000  # Offline buffer is not dynamically alocated
