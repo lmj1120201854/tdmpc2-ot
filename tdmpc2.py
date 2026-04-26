@@ -97,11 +97,19 @@ class TDMPC2(torch.nn.Module):
             )
         )
 
-        self.mask = np.triu(np.tril(np.ones((
-            self.cfg.maniskill.max_episode_steps, 
-            self.cfg.maniskill.max_episode_steps)),
-            k=self.cfg.mask_k), 
-            k=-self.cfg.mask_k)
+        # OT Sinkhorn 的时间对角 mask —— 使用通用 `episode_length`，而不是硬编码
+        # 某个具体后端的 max_episode_steps，避免不同 env 时字段缺失。
+        _mask_len = int(
+            getattr(
+                self.cfg,
+                "episode_length",
+                self.cfg.maniskill.max_episode_steps,
+            )
+        )
+        self.mask = np.triu(
+            np.tril(np.ones((_mask_len, _mask_len)), k=self.cfg.mask_k),
+            k=-self.cfg.mask_k,
+        )
 
         # === RND 模块 ===
         self.use_rnd = bool(getattr(self.cfg, "use_rnd", True))
@@ -244,6 +252,17 @@ class TDMPC2(torch.nn.Module):
         """
         obs = torch.as_tensor(observations).float().to(self.device)
         num_envs = obs.shape[0]
+        T = obs.shape[1]
+
+        # Sanity check: OT 需要在线轨迹长度与 demo 长度、mask 尺寸一致
+        demo_T = self.demos.shape[1]
+        mask_T = self.mask.shape[0]
+        if not (T == demo_T == mask_T):
+            raise ValueError(
+                f"OT rewarder length mismatch: online T={T}, demo T={demo_T}, "
+                f"mask T={mask_T}. Check `episode_length`, demo trajectory length "
+                f"and `mask` construction."
+            )
 
         ot_rewards_list = []
         cost_min, cost_max = float("inf"), float("-inf")
@@ -251,10 +270,19 @@ class TDMPC2(torch.nn.Module):
         with torch.no_grad():
             # 将所有 env 的轨迹拼在一起做一次 ResNet 前向，减少 Python 开销
             # obs: [N, T, C, H, W] -> [N*T, C, H, W]
-            N, T = obs.shape[0], obs.shape[1]
-            flat_obs = obs.reshape(N * T, *obs.shape[2:])
+            flat_obs = obs.reshape(num_envs * T, *obs.shape[2:])
             flat_feat = self.cost_encoder(flat_obs)  # [N*T, D]
-            feat = flat_feat.reshape(N, T, -1)       # [N, T, D]
+
+            # Sanity check: online feat dim 需要和 demo feat dim 一致
+            demo_D = self.demos.shape[-1]
+            if flat_feat.shape[-1] != demo_D:
+                raise ValueError(
+                    f"OT rewarder feature-dim mismatch: online={flat_feat.shape[-1]} vs "
+                    f"demo={demo_D}. 常见原因是在线 rgb 图像分辨率与 demo 不一致，"
+                    f"导致 ResNet flatten 后的维度不同。请确认 env `image_size`。"
+                )
+
+            feat = flat_feat.reshape(num_envs, T, -1)  # [N, T, D]
 
             for env_idx in range(num_envs):
                 encoded_trajectory = feat[env_idx]   # [T, D]
@@ -365,11 +393,11 @@ class TDMPC2(torch.nn.Module):
             G = G + discount * step_reward
 
             z = next_z
-            discount_update = (
-                self.discount[torch.tensor(task)]
-                if self.cfg.multitask
-                else self.discount
-            )
+            if self.cfg.multitask:
+                _task_tensor = task if isinstance(task, torch.Tensor) else torch.tensor(task)
+                discount_update = self.discount[_task_tensor]
+            else:
+                discount_update = self.discount
             discount = discount * discount_update
         return G + discount * self.model.Q(
             z, self.model.pi(z, task)[1], task, return_type="avg"
@@ -734,8 +762,11 @@ class TDMPC2(torch.nn.Module):
             obs, action, reward, ot_reward, task = sampled
         elif len(sampled) == 4:
             obs, action, reward, task = sampled
-            # 无 OT 奖励通道的 buffer：用 NaN 占位，_update 里会 mask 掉
-            ot_reward = torch.full_like(reward, float("nan"))
+            # 无 OT 奖励通道的 buffer：用 float32 NaN 占位，_update 里会 mask 掉.
+            # 不用 full_like(reward) 是因为 reward 可能是 int32 dtype.
+            ot_reward = torch.full(
+                reward.shape, float("nan"), dtype=torch.float32, device=reward.device
+            )
         else:
             raise ValueError(f"Unexpected buffer.sample() return length: {len(sampled)}")
 

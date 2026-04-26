@@ -126,6 +126,9 @@ class OTTrainer(Trainer):
         self.cfg.pretrain.eval_freq = n_iterations // 25
         start_time = time()
         best_model, best_score = deepcopy(self.agent.bc_model.state_dict()), 0
+        # 提前定义 best_seed / eval_metrics，避免在所有 eval 都得到 reward=0 时后续未定义
+        best_seed = 0
+        eval_metrics = None
 
         print(
             colored(
@@ -146,6 +149,9 @@ class OTTrainer(Trainer):
                     best_model = deepcopy(self.agent.bc_model.state_dict())
                     best_score = eval_metrics["episode_reward"]
                     best_seed = eval_metrics["best_seed"]
+                elif best_seed == 0 and eval_metrics.get("best_seed") is not None:
+                    # 如果所有 reward 都是 0, 至少保留一个有效 seed
+                    best_seed = eval_metrics["best_seed"]
 
             if self._pretrain_step % self.cfg.pretrain.log_freq == 0:
                 metrics.update(
@@ -158,7 +164,8 @@ class OTTrainer(Trainer):
 
         if best_score == 0:
             best_model = deepcopy(self.agent.bc_model.state_dict())
-            best_seed = eval_metrics["best_seed"]
+            if eval_metrics is not None and eval_metrics.get("best_seed") is not None:
+                best_seed = eval_metrics["best_seed"]
 
         self.agent.model.eval()
         self.agent.model.load_state_dict(best_model)

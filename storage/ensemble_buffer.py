@@ -48,16 +48,20 @@ class EnsembleBuffer(Buffer):
 
         b_size = td.shape[1]
         td = td.permute(1, 0)
-        
-        # b_size: 16, success_mask: tensor([0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0.], dtype=torch.float64)
 
+        # DEMO3 依赖整数 stage-id 形式的 reward (见 sample_for_disc 中的相等比较),
+        # 其它场景 (如 OT) 如果强转 int32 会丢失连续奖励信息, 因此按 cfg 分支处理.
+        _cast_int_reward = bool(getattr(self.cfg, "enable_reward_learning", False))
+
+        # b_size: 16, success_mask: tensor([0., 0., 0., ...], dtype=torch.float64)
         for i in range(b_size):
             if success_mask[i]:
                 ep_td = td[i]
                 ep_td["episode"] = torch.ones_like(ep_td["reward"], dtype=torch.int64) * torch.arange(
                     self._offline_buffer._num_eps, self._offline_buffer._num_eps + 1
                 )
-                ep_td["reward"] = torch.round(ep_td["reward"]).to(torch.int32)
+                if _cast_int_reward:
+                    ep_td["reward"] = torch.round(ep_td["reward"]).to(torch.int32)
                 self._offline_buffer._buffer.extend(ep_td)
                 if ep_td.shape[0] > self._offline_buffer._max_length:
                     self._offline_buffer._max_length = ep_td.shape[0]
@@ -73,21 +77,37 @@ class EnsembleBuffer(Buffer):
         NOTE: offline demos don't carry OT rewards; we pad those positions with
         NaN so the agent update can build a mask and exclude them from
         ot_reward loss while still keeping tensor shapes aligned.
+
+        NOTE: offline `reward` may be stored as int32 (see `add_success_data`),
+        so NaN padding is created via `torch.full(..., dtype=float32)` rather
+        than `torch.full_like(reward0, nan)` which would error on int dtype.
         """
         if return_td:
             raise NotImplementedError(
                 f"TensorDict return not implemented for EnsembleBuffer"
             )
+
+        def _nan_like_float(ref):
+            return torch.full(
+                ref.shape, float("nan"), dtype=torch.float32, device=ref.device
+            )
+
         if self._offline_buffer.batch_size <= 0:
             obs, action, reward, task = super().sample()
-            ot_reward = torch.full_like(reward, float("nan"))
+            ot_reward = _nan_like_float(reward)
             return obs, action, reward, ot_reward, task
 
         obs0, action0, reward0, task0 = self._offline_buffer.sample()
         obs1, action1, reward1, ot_reward1, task1 = super().ot_sample()
 
-        # Pad offline segment with NaN to keep batch dims aligned.
-        ot_reward0 = torch.full_like(reward0, float("nan"))
+        # Align reward dtype: offline may be int32 (add_success_data), online is float32.
+        reward0 = reward0.to(torch.float32)
+        reward1 = reward1.to(torch.float32)
+
+        # Pad offline segment with NaN (float32) to keep batch dims aligned.
+        ot_reward0 = _nan_like_float(reward0)
+        # Also guarantee ot_reward1 is float32 before concat
+        ot_reward1 = ot_reward1.to(torch.float32)
 
         return (
             torch.cat([obs0, obs1], dim=1),
