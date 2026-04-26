@@ -592,14 +592,31 @@ class TDMPC2(torch.nn.Module):
         #   因此直接在完整 rollout 上预测即可。
         ot_reward_preds = self.model.ot_reward(_zs, task)
 
+        # OT reward 可能在 EnsembleBuffer 的 offline 段为 NaN (demo 没有 ot_reward),
+        # 构造 per-sample mask, 只对 online 段样本计算 ot_reward_loss.
+        # ot_reward shape: [horizon, batch, 1]
+        ot_valid_mask = (~torch.isnan(ot_reward)).float()              # [T, B, 1]
+        ot_reward_clean = torch.where(
+            ot_valid_mask.bool(), ot_reward, torch.zeros_like(ot_reward)
+        )
+
         # Compute losses
         reward_loss, ot_reward_loss, value_loss = 0, 0, 0
-        for t, (rew_pred_unbind, rew_unbind, ot_rew_pred_unbind, ot_rew_unbind, td_targets_unbind, qs_unbind) in enumerate(
+        for t, (
+            rew_pred_unbind,
+            rew_unbind,
+            ot_rew_pred_unbind,
+            ot_rew_unbind,
+            ot_mask_unbind,
+            td_targets_unbind,
+            qs_unbind,
+        ) in enumerate(
             zip(
                 reward_preds.unbind(0),
                 reward.unbind(0),
                 ot_reward_preds.unbind(0),
-                ot_reward.unbind(0),
+                ot_reward_clean.unbind(0),
+                ot_valid_mask.unbind(0),
                 td_targets.unbind(0),
                 qs.unbind(1),
             )
@@ -610,10 +627,12 @@ class TDMPC2(torch.nn.Module):
                 * self.cfg.rho**t
             )
 
+            # masked mean: sum(loss * mask) / max(sum(mask), 1)
+            ot_ce = math.soft_ce(ot_rew_pred_unbind, ot_rew_unbind, self.cfg)
+            denom = ot_mask_unbind.sum().clamp_min(1.0)
             ot_reward_loss = (
                 ot_reward_loss
-                + math.soft_ce(ot_rew_pred_unbind, ot_rew_unbind, self.cfg).mean()
-                * self.cfg.rho**t
+                + (ot_ce * ot_mask_unbind).sum() / denom * self.cfg.rho**t
             )
 
             for _, qs_unbind_unbind in enumerate(qs_unbind.unbind(0)):
@@ -715,7 +734,8 @@ class TDMPC2(torch.nn.Module):
             obs, action, reward, ot_reward, task = sampled
         elif len(sampled) == 4:
             obs, action, reward, task = sampled
-            ot_reward = torch.zeros_like(reward)
+            # 无 OT 奖励通道的 buffer：用 NaN 占位，_update 里会 mask 掉
+            ot_reward = torch.full_like(reward, float("nan"))
         else:
             raise ValueError(f"Unexpected buffer.sample() return length: {len(sampled)}")
 

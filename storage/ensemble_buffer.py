@@ -65,22 +65,35 @@ class EnsembleBuffer(Buffer):
 
 
     def sample(self, return_td=False):
-        """Sample a batch of subsequences from the two buffers."""
+        """Sample a batch of subsequences from the two buffers.
+
+        Returns a 5-tuple (obs, action, reward, ot_reward, task) with a unified
+        batch dimension `offline_bs + online_bs`.
+
+        NOTE: offline demos don't carry OT rewards; we pad those positions with
+        NaN so the agent update can build a mask and exclude them from
+        ot_reward loss while still keeping tensor shapes aligned.
+        """
         if return_td:
             raise NotImplementedError(
                 f"TensorDict return not implemented for EnsembleBuffer"
             )
         if self._offline_buffer.batch_size <= 0:
-            return super().sample()
+            obs, action, reward, task = super().sample()
+            ot_reward = torch.full_like(reward, float("nan"))
+            return obs, action, reward, ot_reward, task
 
         obs0, action0, reward0, task0 = self._offline_buffer.sample()
-        obs1, action1, reward1, ot_reward, task1 = super().ot_sample()
-        
+        obs1, action1, reward1, ot_reward1, task1 = super().ot_sample()
+
+        # Pad offline segment with NaN to keep batch dims aligned.
+        ot_reward0 = torch.full_like(reward0, float("nan"))
+
         return (
             torch.cat([obs0, obs1], dim=1),
             torch.cat([action0, action1], dim=1),
             torch.cat([reward0, reward1], dim=1),
-            ot_reward,
+            torch.cat([ot_reward0, ot_reward1], dim=1),
             torch.cat([task0, task1], dim=0) if task0 and task1 else None,
         )
 
